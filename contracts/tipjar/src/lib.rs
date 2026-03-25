@@ -31,6 +31,14 @@ pub struct Milestone {
     pub completed: bool,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchTip {
+    pub creator: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
 /// Role enum for role-based access control.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +90,8 @@ pub enum TipJarError {
     InvalidGoalAmount = 8,
     Unauthorized = 9,
     RoleNotFound = 10,
+    BatchTooLarge = 11,
+    InsufficientBalance = 12,
 }
 
 #[contract]
@@ -343,6 +353,38 @@ impl TipJarContract {
             caller.clone(),
         );
     }
+
+    /// Tips multiple creators in a single transaction.
+    ///
+    /// Returns one `Result<(), TipJarError>` per entry, in input order.
+    /// A single `sender.require_auth()` covers the entire batch.
+    pub fn tip_batch(env: Env, sender: Address, tips: soroban_sdk::Vec<BatchTip>) -> soroban_sdk::Vec<Result<(), TipJarError>> {
+        // 1. Pause guard — same pattern as `tip`
+        if Self::is_paused(&env) {
+            panic!("Contract is paused");
+        }
+
+        // 2. Empty batch short-circuit — no auth required
+        if tips.len() == 0 {
+            return soroban_sdk::Vec::new(&env);
+        }
+
+        // 3. Size guard
+        if tips.len() > 50u32 {
+            panic_with_error!(&env, TipJarError::BatchTooLarge);
+        }
+
+        // 4. Single authorization for the entire batch
+        sender.require_auth();
+
+        // 5. Process each entry independently
+        let mut results: soroban_sdk::Vec<Result<(), TipJarError>> = soroban_sdk::Vec::new(&env);
+        for entry in tips.iter() {
+            results.push_back(process_single_tip(&env, &sender, &entry));
+        }
+
+        results
+    }
 }
 
 /// Shared write path for granting a role. Used by `grant_role` and `init`.
@@ -393,6 +435,65 @@ fn require_role(env: &Env, addr: &Address, required: Role) {
     }
 }
 
+/// Processes a single tip entry within a batch.
+///
+/// Validates amount, checks token whitelist, pre-checks sender balance,
+/// performs the transfer, updates storage, and emits a tip event.
+fn process_single_tip(env: &Env, sender: &Address, entry: &BatchTip) -> Result<(), TipJarError> {
+    // 1. Validate amount > 0
+    if entry.amount <= 0 {
+        return Err(TipJarError::InvalidAmount);
+    }
+
+    // 2. Check token whitelist in INSTANCE storage
+    let whitelisted: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::TokenWhitelist(entry.token.clone()))
+        .unwrap_or(false);
+    if !whitelisted {
+        return Err(TipJarError::TokenNotWhitelisted);
+    }
+
+    // 3. Pre-check sender balance to avoid panic on transfer
+    let token_client = token::Client::new(env, &entry.token);
+    let sender_balance = token_client.balance(sender);
+    if sender_balance < entry.amount {
+        return Err(TipJarError::InsufficientBalance);
+    }
+
+    // 4. Transfer tokens from sender to this contract
+    token_client.transfer(sender, &env.current_contract_address(), &entry.amount);
+
+    // 5. Increment CreatorBalance in PERSISTENT storage
+    let balance_key = DataKey::CreatorBalance(entry.creator.clone(), entry.token.clone());
+    let next_balance: i128 = env
+        .storage()
+        .persistent()
+        .get(&balance_key)
+        .unwrap_or(0)
+        + entry.amount;
+    env.storage().persistent().set(&balance_key, &next_balance);
+
+    // 6. Increment CreatorTotal in PERSISTENT storage
+    let total_key = DataKey::CreatorTotal(entry.creator.clone(), entry.token.clone());
+    let next_total: i128 = env
+        .storage()
+        .persistent()
+        .get(&total_key)
+        .unwrap_or(0)
+        + entry.amount;
+    env.storage().persistent().set(&total_key, &next_total);
+
+    // 7. Emit tip event: topics = ("tip", creator, token), data = (sender, amount)
+    env.events().publish(
+        (symbol_short!("tip"), entry.creator.clone(), entry.token.clone()),
+        (sender.clone(), entry.amount),
+    );
+
+    Ok(())
+}
+
 /// Panics with `TipJarError::Unauthorized` unless `addr` holds at least one role in `roles`.
 fn require_any_role(env: &Env, addr: &Address, roles: &[Role]) {
     let assigned: Option<Role> = env
@@ -413,7 +514,7 @@ fn require_any_role(env: &Env, addr: &Address, roles: &[Role]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, token, Address, Env};
+    use soroban_sdk::{testutils::{Address as _, Events as _}, token, Address, Env};
 
     /// Returns (env, contract_id, token_id_1, token_id_2, admin).
     fn setup() -> (Env, Address, Address, Address, Address) {
@@ -761,5 +862,337 @@ mod tests {
         let client = TipJarContractClient::new(&env, &contract_id);
 
         assert!(client.has_role(&admin, &Role::Admin));
+    }
+
+    // ── Task 3.2: tip_batch control flow ─────────────────────────────────────
+
+    #[test]
+    fn test_tip_batch_empty_returns_empty_vec() {
+        let (env, contract_id, _, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+
+        let tips: soroban_sdk::Vec<BatchTip> = soroban_sdk::Vec::new(&env);
+        let results = client.tip_batch(&sender, &tips);
+
+        assert_eq!(results.len(), 0);
+        // No auth should have been recorded (empty batch short-circuits before require_auth).
+        let auths = env.auths();
+        assert!(
+            auths.is_empty(),
+            "no auth should be recorded for an empty batch"
+        );
+    }
+
+    #[test]
+    fn test_tip_batch_single_valid_entry() {
+        let (env, contract_id, token_id_1, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id_1);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        token_admin.mint(&sender, &500);
+
+        let mut tips: soroban_sdk::Vec<BatchTip> = soroban_sdk::Vec::new(&env);
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id_1.clone(),
+            amount: 100,
+        });
+
+        let results = client.tip_batch(&sender, &tips);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+
+        // Storage updated
+        assert_eq!(client.get_withdrawable_balance(&creator, &token_id_1), 100);
+        assert_eq!(client.get_total_tips(&creator, &token_id_1), 100);
+    }
+
+    #[test]
+    fn test_tip_batch_51_entries_returns_batch_too_large() {
+        let (env, contract_id, token_id_1, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id_1);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        token_admin.mint(&sender, &100_000);
+
+        let mut tips: soroban_sdk::Vec<BatchTip> = soroban_sdk::Vec::new(&env);
+        for _ in 0..51 {
+            tips.push_back(BatchTip {
+                creator: creator.clone(),
+                token: token_id_1.clone(),
+                amount: 1,
+            });
+        }
+
+        let result = client.try_tip_batch(&sender, &tips);
+        assert!(result.is_err(), "51-entry batch should return an error");
+    }
+
+    #[test]
+    fn test_tip_batch_exactly_50_entries_succeeds() {
+        let (env, contract_id, token_id_1, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id_1);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        // Mint enough for 50 tips of 10 each
+        token_admin.mint(&sender, &500);
+
+        let mut tips: soroban_sdk::Vec<BatchTip> = soroban_sdk::Vec::new(&env);
+        for _ in 0..50 {
+            tips.push_back(BatchTip {
+                creator: creator.clone(),
+                token: token_id_1.clone(),
+                amount: 10,
+            });
+        }
+
+        let results = client.tip_batch(&sender, &tips);
+
+        assert_eq!(results.len(), 50);
+        for i in 0..50 {
+            assert_eq!(results.get(i).unwrap(), Ok(()));
+        }
+
+        // All 50 tips accumulated
+        assert_eq!(client.get_withdrawable_balance(&creator, &token_id_1), 500);
+        assert_eq!(client.get_total_tips(&creator, &token_id_1), 500);
+    }
+
+    #[test]
+    fn test_tip_batch_paused_rejects_batch() {
+        let (env, contract_id, token_id_1, _, admin) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id_1);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        token_admin.mint(&sender, &500);
+        client.pause(&admin);
+
+        let mut tips: soroban_sdk::Vec<BatchTip> = soroban_sdk::Vec::new(&env);
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id_1.clone(),
+            amount: 100,
+        });
+
+        let result = client.try_tip_batch(&sender, &tips);
+        assert!(result.is_err(), "paused contract should reject tip_batch");
+
+        // No storage changes
+        assert_eq!(client.get_withdrawable_balance(&creator, &token_id_1), 0);
+        assert_eq!(client.get_total_tips(&creator, &token_id_1), 0);
+    }
+
+    // ── Task 5.1: mixed and accumulation scenarios ────────────────────────────
+
+    #[test]
+    fn test_tip_batch_mixed_invalid_amount() {
+        let (env, contract_id, token_id_1, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id_1);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        token_admin.mint(&sender, &500);
+
+        let mut tips: soroban_sdk::Vec<BatchTip> = soroban_sdk::Vec::new(&env);
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id_1.clone(),
+            amount: 100, // valid
+        });
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id_1.clone(),
+            amount: 0, // invalid
+        });
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id_1.clone(),
+            amount: 50, // valid
+        });
+
+        let results = client.tip_batch(&sender, &tips);
+
+        // Result vec length == input length
+        assert_eq!(results.len(), 3);
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        assert_eq!(results.get(1).unwrap(), Err(TipJarError::InvalidAmount));
+        assert_eq!(results.get(2).unwrap(), Ok(()));
+
+        // Only valid entries committed: 100 + 50 = 150
+        assert_eq!(client.get_withdrawable_balance(&creator, &token_id_1), 150);
+        assert_eq!(client.get_total_tips(&creator, &token_id_1), 150);
+    }
+
+    #[test]
+    fn test_tip_batch_mixed_non_whitelisted_token() {
+        let (env, contract_id, token_id_1, token_id_2, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin_1 = token::StellarAssetClient::new(&env, &token_id_1);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        // token_id_2 is NOT whitelisted (setup only whitelists token_id_1)
+        token_admin_1.mint(&sender, &500);
+
+        let mut tips: soroban_sdk::Vec<BatchTip> = soroban_sdk::Vec::new(&env);
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id_1.clone(),
+            amount: 100, // valid, whitelisted
+        });
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id_2.clone(),
+            amount: 50, // invalid, not whitelisted
+        });
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id_1.clone(),
+            amount: 75, // valid, whitelisted
+        });
+
+        let results = client.tip_batch(&sender, &tips);
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        assert_eq!(
+            results.get(1).unwrap(),
+            Err(TipJarError::TokenNotWhitelisted)
+        );
+        assert_eq!(results.get(2).unwrap(), Ok(()));
+
+        // Only whitelisted entries committed
+        assert_eq!(client.get_withdrawable_balance(&creator, &token_id_1), 175);
+        assert_eq!(client.get_withdrawable_balance(&creator, &token_id_2), 0);
+    }
+
+    #[test]
+    fn test_tip_batch_mixed_insufficient_balance() {
+        let (env, contract_id, token_id_1, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id_1);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        // Mint only 100 tokens — not enough for a 200-token tip
+        token_admin.mint(&sender, &150);
+
+        let mut tips: soroban_sdk::Vec<BatchTip> = soroban_sdk::Vec::new(&env);
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id_1.clone(),
+            amount: 50, // valid, sufficient
+        });
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id_1.clone(),
+            amount: 200, // insufficient balance
+        });
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id_1.clone(),
+            amount: 50, // valid, sufficient (100 remaining after first tip)
+        });
+
+        let results = client.tip_batch(&sender, &tips);
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        assert_eq!(
+            results.get(1).unwrap(),
+            Err(TipJarError::InsufficientBalance)
+        );
+        assert_eq!(results.get(2).unwrap(), Ok(()));
+
+        // 50 + 50 = 100 committed
+        assert_eq!(client.get_withdrawable_balance(&creator, &token_id_1), 100);
+    }
+
+    #[test]
+    fn test_tip_batch_accumulates_same_creator() {
+        let (env, contract_id, token_id_1, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id_1);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        token_admin.mint(&sender, &1_000);
+
+        let mut tips: soroban_sdk::Vec<BatchTip> = soroban_sdk::Vec::new(&env);
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id_1.clone(),
+            amount: 100,
+        });
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id_1.clone(),
+            amount: 200,
+        });
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id_1.clone(),
+            amount: 300,
+        });
+
+        let results = client.tip_batch(&sender, &tips);
+
+        assert_eq!(results.len(), 3);
+        for i in 0..3 {
+            assert_eq!(results.get(i).unwrap(), Ok(()));
+        }
+
+        // 100 + 200 + 300 = 600 accumulated for the same creator
+        assert_eq!(client.get_withdrawable_balance(&creator, &token_id_1), 600);
+        assert_eq!(client.get_total_tips(&creator, &token_id_1), 600);
+    }
+
+    #[test]
+    fn test_tip_batch_events_match_single_tip() {
+        let (env, contract_id, token_id_1, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id_1);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        token_admin.mint(&sender, &1_000);
+
+        // Call single tip and capture the event
+        client.tip(&sender, &creator, &token_id_1, &100);
+        let single_events = env.events().all();
+        let (single_contract, single_topics, _) = single_events.last().unwrap();
+
+        // Call tip_batch with one equivalent entry
+        let mut tips: soroban_sdk::Vec<BatchTip> = soroban_sdk::Vec::new(&env);
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id_1.clone(),
+            amount: 100,
+        });
+        client.tip_batch(&sender, &tips);
+
+        let batch_events = env.events().all();
+        let (batch_contract, batch_topics, _) = batch_events.last().unwrap();
+
+        // Contract address and topics (symbol, creator, token) must match
+        assert_eq!(
+            single_contract, batch_contract,
+            "contract address should match"
+        );
+        assert_eq!(
+            single_topics, batch_topics,
+            "event topics (\"tip\", creator, token) should match"
+        );
     }
 }
