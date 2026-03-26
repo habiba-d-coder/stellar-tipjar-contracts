@@ -72,6 +72,20 @@ pub enum ParticipantKind {
     Creator,
 }
 
+/// Query parameters for tip history retrieval.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TipHistoryQuery {
+    pub creator: Option<Address>,
+    pub sender: Option<Address>,
+    pub min_amount: Option<i128>,
+    pub max_amount: Option<i128>,
+    pub start_time: Option<u64>,
+    pub end_time: Option<u64>,
+    pub limit: u32,
+    pub offset: u32,
+}
+
 /// Role enum for role-based access control.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -373,6 +387,137 @@ impl TipJarContract {
 
         env.events()
             .publish((symbol_short!("withdraw"), creator, token), amount);
+    }
+
+    /// Returns tip-with-message records matching the given query filters, sorted by
+    /// timestamp descending, with offset/limit pagination.
+    ///
+    /// When `query.creator` is `Some`, only that creator's messages are scanned.
+    /// When `None`, all known creators (from the AllTime leaderboard participant list) are scanned.
+    /// No auth required; available even when the contract is paused.
+    pub fn get_tip_history(env: Env, query: TipHistoryQuery) -> Vec<TipWithMessage> {
+        let limit = if query.limit == 0 || query.limit > 100 { 100 } else { query.limit };
+
+        // Collect all candidate records from relevant creator(s).
+        let mut all: Vec<TipWithMessage> = Vec::new(&env);
+
+        if let Some(ref creator) = query.creator {
+            collect_creator_messages(&env, creator, &mut all);
+        } else {
+            // Scan all known creators from the AllTime bucket participant list.
+            let participants: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::CreatorParticipants(0u32))
+                .unwrap_or_else(|| Vec::new(&env));
+            for creator in participants.iter() {
+                collect_creator_messages(&env, &creator, &mut all);
+            }
+        }
+
+        // Apply filters.
+        let mut filtered: Vec<TipWithMessage> = Vec::new(&env);
+        for record in all.iter() {
+            if let Some(ref sender) = query.sender {
+                if record.sender != *sender { continue; }
+            }
+            if let Some(min) = query.min_amount {
+                if record.amount < min { continue; }
+            }
+            if let Some(max) = query.max_amount {
+                if record.amount > max { continue; }
+            }
+            if let Some(start) = query.start_time {
+                if record.timestamp < start { continue; }
+            }
+            if let Some(end) = query.end_time {
+                if record.timestamp > end { continue; }
+            }
+            filtered.push_back(record);
+        }
+
+        // Sort descending by timestamp (selection sort — no_std compatible).
+        let n = filtered.len();
+        let mut i = 0u32;
+        while i < n {
+            let mut newest = i;
+            let mut j = i + 1;
+            while j < n {
+                if filtered.get(j).unwrap().timestamp > filtered.get(newest).unwrap().timestamp {
+                    newest = j;
+                }
+                j += 1;
+            }
+            if newest != i {
+                let a = filtered.get(i).unwrap();
+                let b = filtered.get(newest).unwrap();
+                filtered.set(i, b);
+                filtered.set(newest, a);
+            }
+            i += 1;
+        }
+
+        // Paginate.
+        let total = filtered.len();
+        if query.offset >= total {
+            return Vec::new(&env);
+        }
+        let end = {
+            let candidate = query.offset + limit;
+            if candidate > total { total } else { candidate }
+        };
+        let mut page: Vec<TipWithMessage> = Vec::new(&env);
+        let mut idx = query.offset;
+        while idx < end {
+            page.push_back(filtered.get(idx).unwrap());
+            idx += 1;
+        }
+        page
+    }
+
+    /// Returns tip-with-message records for a specific creator, sorted by timestamp
+    /// descending, limited to `limit` results (capped at 100).
+    ///
+    /// No auth required; available even when the contract is paused.
+    pub fn get_creator_tips(env: Env, creator: Address, limit: u32) -> Vec<TipWithMessage> {
+        let effective_limit = if limit == 0 || limit > 100 { 100 } else { limit };
+        let messages: Vec<TipWithMessage> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorMessages(creator))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Sort descending by timestamp.
+        let mut sorted = messages.clone();
+        let n = sorted.len();
+        let mut i = 0u32;
+        while i < n {
+            let mut newest = i;
+            let mut j = i + 1;
+            while j < n {
+                if sorted.get(j).unwrap().timestamp > sorted.get(newest).unwrap().timestamp {
+                    newest = j;
+                }
+                j += 1;
+            }
+            if newest != i {
+                let a = sorted.get(i).unwrap();
+                let b = sorted.get(newest).unwrap();
+                sorted.set(i, b);
+                sorted.set(newest, a);
+            }
+            i += 1;
+        }
+
+        // Return up to effective_limit records.
+        let end = if effective_limit > n { n } else { effective_limit };
+        let mut result: Vec<TipWithMessage> = Vec::new(&env);
+        let mut idx = 0u32;
+        while idx < end {
+            result.push_back(sorted.get(idx).unwrap());
+            idx += 1;
+        }
+        result
     }
 
     pub fn is_whitelisted(env: Env, token: Address) -> bool {
@@ -1152,6 +1297,18 @@ fn ranked_page(
     }
 
     result
+}
+
+/// Appends all `TipWithMessage` records for `creator` into `out`.
+fn collect_creator_messages(env: &Env, creator: &Address, out: &mut Vec<TipWithMessage>) {
+    let messages: Vec<TipWithMessage> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::CreatorMessages(creator.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+    for m in messages.iter() {
+        out.push_back(m);
+    }
 }
 
 #[cfg(test)]
