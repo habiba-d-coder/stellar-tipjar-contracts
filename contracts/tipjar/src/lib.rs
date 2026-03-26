@@ -128,6 +128,20 @@ pub struct MatchingProgram {
     pub active: bool,
 }
 
+/// A record of a single tip, used for refund tracking.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TipRecord {
+    pub id: u64,
+    pub sender: Address,
+    pub creator: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+    pub refunded: bool,
+    pub refund_requested: bool,
+}
+
 /// Storage layout for persistent contract data.
 #[derive(Clone)]
 #[contracttype]
@@ -172,14 +186,10 @@ pub enum DataKey {
     MatchingProgram(u64),
     /// Matching program IDs indexed under a creator.
     CreatorMatchingPrograms(Address),
-    /// DEX contract address for cross-contract swaps.
-    DexContract,
-    /// NFT contract address for reward minting.
-    NftContract,
-    /// Global tip counter for assigning unique tip IDs.
-    TipCounter,
-    /// Individual tip record by global ID.
+    /// Individual tip record by global tip ID.
     TipRecord(u64),
+    /// Global tip counter for assigning tip IDs.
+    TipCounter,
 }
 
 #[contracterror]
@@ -576,6 +586,90 @@ impl TipJarContract {
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    fn next_tip_id(env: &Env) -> u64 {
+        let id: u64 = env.storage().instance().get(&DataKey::TipCounter).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TipCounter, &(id + 1));
+        id
+    }
+
+    /// Sender requests a refund within the grace period (24 h). Auto-approved if within grace.
+    pub fn request_refund(env: Env, sender: Address, tip_id: u64) {
+        sender.require_auth();
+        let mut record: TipRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TipRecord(tip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::LockedTipNotFound));
+
+        if record.sender != sender {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        if record.refunded {
+            panic_with_error!(&env, TipJarError::NothingToWithdraw);
+        }
+
+        let elapsed = env.ledger().timestamp().saturating_sub(record.timestamp);
+        if elapsed <= GRACE_PERIOD_SECS {
+            // Auto-approve: deduct from creator balance and refund sender.
+            let balance_key = DataKey::CreatorBalance(record.creator.clone(), record.token.clone());
+            let balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+            let new_balance = if balance >= record.amount { balance - record.amount } else { 0 };
+            env.storage().persistent().set(&balance_key, &new_balance);
+
+            let token_client = token::Client::new(&env, &record.token);
+            token_client.transfer(&env.current_contract_address(), &sender, &record.amount);
+
+            record.refunded = true;
+            env.storage().persistent().set(&DataKey::TipRecord(tip_id), &record);
+
+            env.events().publish(
+                (symbol_short!("refund"), record.creator.clone()),
+                (tip_id, sender, record.amount),
+            );
+        } else {
+            // Past grace period: mark as requested, requires admin approval.
+            record.refund_requested = true;
+            env.storage().persistent().set(&DataKey::TipRecord(tip_id), &record);
+
+            env.events().publish(
+                (symbol_short!("ref_req"), record.creator.clone()),
+                (tip_id, sender),
+            );
+        }
+    }
+
+    /// Admin approves a refund request that is past the grace period.
+    pub fn approve_refund(env: Env, admin: Address, tip_id: u64) {
+        admin.require_auth();
+        require_role(&env, &admin, Role::Admin);
+
+        let mut record: TipRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TipRecord(tip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::LockedTipNotFound));
+
+        if !record.refund_requested || record.refunded {
+            panic_with_error!(&env, TipJarError::NothingToWithdraw);
+        }
+
+        let balance_key = DataKey::CreatorBalance(record.creator.clone(), record.token.clone());
+        let balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+        let new_balance = if balance >= record.amount { balance - record.amount } else { 0 };
+        env.storage().persistent().set(&balance_key, &new_balance);
+
+        let token_client = token::Client::new(&env, &record.token);
+        token_client.transfer(&env.current_contract_address(), &record.sender, &record.amount);
+
+        record.refunded = true;
+        env.storage().persistent().set(&DataKey::TipRecord(tip_id), &record);
+
+        env.events().publish(
+            (symbol_short!("ref_appr"), record.creator.clone()),
+            (tip_id, record.sender, record.amount),
+        );
     }
 
     /// Returns `true` iff `target` currently holds `role`. No authorization required.
