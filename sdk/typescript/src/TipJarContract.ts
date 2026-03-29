@@ -4,12 +4,10 @@ import {
   TransactionBuilder,
   Networks,
   BASE_FEE,
-  Keypair,
 } from '@stellar/stellar-sdk';
 
 import { SendTipParams, TipResult, WithdrawResult } from './types';
-import { getRpcUrl, retry, parseEvents } from './utils';
-import { TransactionError } from './errors';
+import { getRpcUrl, retry } from './utils';
 
 export class TipJarContract {
   private contract: Contract;
@@ -26,13 +24,59 @@ export class TipJarContract {
         : Networks.PUBLIC;
   }
 
-  /**
-   * Send Tip
-   */
-  async sendTip(
-    params: SendTipParams,
-    secretKey: string
-  ): Promise<TipResult> {
+  /* ===============================
+     WALLET: Freighter Sign
+  ================================ */
+  async signWithFreighter(xdr: string): Promise<string> {
+    if (!(window as any).freighterApi) {
+      throw new Error('Freighter wallet not installed');
+    }
+
+    return await (window as any).freighterApi.signTransaction(xdr, {
+      networkPassphrase: this.networkPassphrase,
+    });
+  }
+
+  /* ===============================
+     WAIT FOR TX CONFIRMATION
+  ================================ */
+  async waitForConfirmation(hash: string): Promise<any> {
+    let tx;
+
+    do {
+      tx = await this.server.getTransaction(hash);
+      if (tx.status === 'SUCCESS') return tx;
+
+      await new Promise((r) => setTimeout(r, 1500));
+    } while (tx.status === 'NOT_FOUND');
+
+    throw new Error('Transaction failed or not confirmed');
+  }
+
+  /* ===============================
+     HANDLE RESPONSE
+  ================================ */
+  private async handleTxResponse(result: any): Promise<TipResult> {
+    if (result.status !== 'PENDING') {
+      throw new Error('Transaction submission failed');
+    }
+
+    const finalTx = await this.waitForConfirmation(result.hash);
+
+    return {
+      success: true,
+      txHash: finalTx.hash,
+    };
+  }
+
+  /* ===============================
+     SEND TIP
+  ================================ */
+  async sendTip(params: SendTipParams): Promise<TipResult> {
+    if (!params.creator.startsWith('G')) {
+      throw new Error('Invalid creator address');
+    }
+
     return retry(async () => {
       const account = await this.server.getAccount(params.tipper);
 
@@ -52,40 +96,38 @@ export class TipJarContract {
         .setTimeout(30)
         .build();
 
-      const keypair = Keypair.fromSecret(secretKey);
-      tx.sign(keypair);
+      const xdr = tx.toXDR();
 
-      const result = await this.server.sendTransaction(tx);
+      const signedXdr = await this.signWithFreighter(xdr);
 
-      if (result.status !== 'PENDING') {
-        throw new TransactionError('Transaction failed');
-      }
+      const signedTx = TransactionBuilder.fromXDR(
+        signedXdr,
+        this.networkPassphrase
+      );
 
-      return {
-        success: true,
-        txHash: result.hash,
-      };
+      const result = await this.server.sendTransaction(signedTx);
+
+      return this.handleTxResponse(result);
     });
   }
 
-  /**
-   * Get Balance (read-only)
-   */
+  /* ===============================
+     GET BALANCE
+  ================================ */
   async getBalance(creator: string): Promise<bigint> {
-    const result = await this.server.simulateTransaction(
+    const simulation = await this.server.simulateTransaction(
       this.contract.call('get_balance', creator)
     );
 
-    return BigInt(result.result?.retval?._value || 0);
+    return BigInt(simulation.result?.retval?._value || 0);
   }
 
-  /**
-   * Withdraw
-   */
+  /* ===============================
+     WITHDRAW
+  ================================ */
   async withdraw(
     creator: string,
-    amount: bigint,
-    secretKey: string
+    amount: bigint
   ): Promise<WithdrawResult> {
     return retry(async () => {
       const account = await this.server.getAccount(creator);
@@ -94,30 +136,24 @@ export class TipJarContract {
         fee: BASE_FEE,
         networkPassphrase: this.networkPassphrase,
       })
-        .addOperation(this.contract.call('withdraw', creator, amount))
+        .addOperation(
+          this.contract.call('withdraw', creator, amount)
+        )
         .setTimeout(30)
         .build();
 
-      const keypair = Keypair.fromSecret(secretKey);
-      tx.sign(keypair);
+      const xdr = tx.toXDR();
 
-      const result = await this.server.sendTransaction(tx);
+      const signedXdr = await this.signWithFreighter(xdr);
 
-      if (result.status !== 'PENDING') {
-        throw new TransactionError('Withdraw failed');
-      }
+      const signedTx = TransactionBuilder.fromXDR(
+        signedXdr,
+        this.networkPassphrase
+      );
 
-      return {
-        success: true,
-        txHash: result.hash,
-      };
+      const result = await this.server.sendTransaction(signedTx);
+
+      return this.handleTxResponse(result);
     });
-  }
-
-  /**
-   * Event Parser
-   */
-  parseEvents(events: any[]) {
-    return parseEvents(events);
   }
 }
