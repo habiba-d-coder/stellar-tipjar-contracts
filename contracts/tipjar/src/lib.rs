@@ -197,6 +197,17 @@ pub struct Subscription {
     pub status: SubscriptionStatus,
 }
 
+/// A time-locked tip that can only be withdrawn after `unlock_time`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeLock {
+    pub sender: Address,
+    pub creator: Address,
+    pub amount: i128,
+    pub unlock_time: u64,
+    pub cancelled: bool,
+}
+
 /// Storage layout for persistent contract data.
 #[derive(Clone)]
 #[contracttype]
@@ -305,6 +316,14 @@ pub enum TipJarError {
     InvalidPercentage = 30,
     /// Contract is paused; state-changing operations are blocked.
     ContractPaused = 31,
+    /// Fee exceeds the maximum allowed (500 bps).
+    FeeExceedsMaximum = 32,
+    /// Time-lock record not found.
+    LockNotFound = 33,
+    /// Unlock time has not been reached yet.
+    NotUnlocked = 34,
+    /// Time-lock has already been cancelled.
+    LockCancelled = 35,
 }
 
 #[contract]
@@ -382,12 +401,12 @@ impl TipJarContract {
     /// One-time setup to choose the administrator for the TipJar.
     pub fn init(env: Env, admin: Address, fee_basis_points: u32, refund_window_seconds: u64) {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(&env, TipJarError::AlreadyInitialized as u32);
+            panic_with_error!(&env, TipJarError::AlreadyInitialized);
         }
         if fee_basis_points > 500 {
             panic_with_error!(&env, TipJarError::FeeExceedsMaximum);
         }
-        env.storage().instance().put(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::FeeBasisPoints, &fee_basis_points);
         env.storage().instance().set(&DataKey::RefundWindow, &refund_window_seconds);
     }
@@ -457,6 +476,7 @@ impl TipJarContract {
     /// Deducts the platform fee before crediting the creator. Returns the tip ID.
     /// Emits `("tip", creator)` with data `(sender, amount)`.
     pub fn tip(env: Env, sender: Address, creator: Address, token: Address, amount: i128) -> u64 {
+        Self::require_not_paused(&env);
         sender.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, TipJarError::InvalidAmount);
@@ -469,30 +489,43 @@ impl TipJarContract {
         if !whitelisted {
             panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
         }
-        token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
 
         let fee_bp: u32 = env.storage().instance().get(&DataKey::FeeBasisPoints).unwrap_or(0);
-        let fee: i128 = (amount * fee_bp as i128) / 10000;
-        let creator_amount = amount - fee;
+        let fee: i128 = (amount * fee_bp as i128) / 10_000;
+        let creator_amount = amount.checked_sub(fee).unwrap_or(0);
 
+        // ── state updates before external call (CEI pattern) ─────────────────
         if fee > 0 {
             let fee_key = DataKey::PlatformFeeBalance(token.clone());
-            let new_fee_bal: i128 = env.storage().instance().get(&fee_key).unwrap_or(0) + fee;
+            let new_fee_bal: i128 = env
+                .storage()
+                .instance()
+                .get(&fee_key)
+                .unwrap_or(0)
+                .checked_add(fee)
+                .expect("fee overflow");
             env.storage().instance().set(&fee_key, &new_fee_bal);
         }
 
         let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
-        let existing_bal: i128 = env.storage().persistent().get(&bal_key)
-            .unwrap_or_else(|| env.storage().instance().get(&bal_key).unwrap_or(0));
-        let new_bal: i128 = existing_bal + amount;
+        let existing_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        let new_bal: i128 = existing_bal.checked_add(creator_amount).expect("balance overflow");
         env.storage().persistent().set(&bal_key, &new_bal);
+
         let tot_key = DataKey::CreatorTotal(creator.clone(), token.clone());
-        let existing_tot: i128 = env.storage().persistent().get(&tot_key)
-            .unwrap_or_else(|| env.storage().instance().get(&tot_key).unwrap_or(0));
-        let new_tot: i128 = existing_tot + amount;
+        let existing_tot: i128 = env.storage().persistent().get(&tot_key).unwrap_or(0);
+        let new_tot: i128 = existing_tot.checked_add(creator_amount).expect("total overflow");
         env.storage().persistent().set(&tot_key, &new_tot);
-        Self::update_leaderboard_stats(&env, &sender, &creator, amount);
-        env.events().publish((symbol_short!("tip"), creator.clone()), (sender, amount));
+
+        let tip_id: u64 = env.storage().instance().get(&DataKey::TipCounter).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TipCounter, &(tip_id + 1));
+
+        Self::update_leaderboard_stats(&env, &sender, &creator, creator_amount);
+
+        // ── external call last ───────────────────────────────────────────────
+        token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
+
+        env.events().publish((symbol_short!("tip"), creator.clone()), (sender, creator_amount));
         tip_id
     }
 
@@ -678,12 +711,14 @@ impl TipJarContract {
         );
 
         let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
-        let new_bal: i128 = env.storage().instance().get(&bal_key).unwrap_or(0) + net;
-        env.storage().instance().set(&bal_key, &new_bal);
+        let new_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0)
+            .checked_add(net).expect("balance overflow");
+        env.storage().persistent().set(&bal_key, &new_bal);
 
         let tot_key = DataKey::CreatorTotal(creator.clone(), token.clone());
-        let new_tot: i128 = env.storage().instance().get(&tot_key).unwrap_or(0) + net;
-        env.storage().instance().set(&tot_key, &new_tot);
+        let new_tot: i128 = env.storage().persistent().get(&tot_key).unwrap_or(0)
+            .checked_add(net).expect("total overflow");
+        env.storage().persistent().set(&tot_key, &new_tot);
 
         env.events()
             .publish((symbol_short!("tip"), creator.clone()), (sender, net));
@@ -1091,6 +1126,251 @@ impl TipJarContract {
                 (symbol_short!("tip_splt"), r.creator.clone()),
                 (sender.clone(), share, r.percentage),
             );
+        }
+    }
+
+    // ── RBAC ─────────────────────────────────────────────────────────────────
+
+    /// Grants `role` to `user`. Caller must be the stored admin.
+    pub fn grant_role(env: Env, admin: Address, user: Address, role: Role) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        env.storage().persistent().set(&DataKey::UserRole(user.clone()), &role);
+        let mut members: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RoleMembers(role.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        if !members.contains(&user) {
+            members.push_back(user.clone());
+            env.storage().persistent().set(&DataKey::RoleMembers(role.clone()), &members);
+        }
+        env.events().publish((symbol_short!("role_grt"),), (user, role));
+    }
+
+    /// Revokes any role from `user`. Caller must be the stored admin.
+    pub fn revoke_role(env: Env, admin: Address, user: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        if let Some(role) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Role>(&DataKey::UserRole(user.clone()))
+        {
+            env.storage().persistent().remove(&DataKey::UserRole(user.clone()));
+            let mut members: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RoleMembers(role.clone()))
+                .unwrap_or_else(|| Vec::new(&env));
+            members.retain(|a| a != user);
+            env.storage().persistent().set(&DataKey::RoleMembers(role.clone()), &members);
+            env.events().publish((symbol_short!("role_rev"),), (user, role));
+        }
+    }
+
+    /// Returns `true` if `user` holds `role`.
+    pub fn has_role(env: Env, user: Address, role: Role) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Role>(&DataKey::UserRole(user))
+            .map(|r| r == role)
+            .unwrap_or(false)
+    }
+
+    /// Internal helper — panics with `Unauthorized` if `user` does not hold `role`.
+    #[allow(dead_code)]
+    fn require_role(env: &Env, user: &Address, role: Role) {
+        let stored: Option<Role> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserRole(user.clone()));
+        if stored != Some(role) {
+            panic_with_error!(env, TipJarError::Unauthorized);
+        }
+    }
+
+    /// Returns all addresses that currently hold `role`.
+    pub fn get_role_members(env: Env, role: Role) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RoleMembers(role))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ── time-locked tips ──────────────────────────────────────────────────────
+
+    /// Creates a time-locked tip for a specific `token`. Tokens are transferred
+    /// immediately into escrow but can only be withdrawn by `creator` after `unlock_time`.
+    ///
+    /// Returns the lock ID.
+    /// Emits `("lock", creator)` with data `(sender, amount, unlock_time, lock_id)`.
+    pub fn tip_time_locked(
+        env: Env,
+        sender: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        unlock_time: u64,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        if unlock_time <= env.ledger().timestamp() {
+            panic_with_error!(&env, TipJarError::InvalidUnlockTime);
+        }
+
+        // State updates before external call (CEI).
+        let lock_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextLockId)
+            .unwrap_or(0);
+        let time_lock = TimeLock {
+            sender: sender.clone(),
+            creator: creator.clone(),
+            amount,
+            unlock_time,
+            cancelled: false,
+        };
+        env.storage().persistent().set(&DataKey::TimeLock(lock_id), &time_lock);
+        env.storage().persistent().set(&DataKey::NextLockId, &(lock_id + 1));
+
+        let mut creator_locks: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorLocks(creator.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        creator_locks.push_back(lock_id);
+        env.storage().persistent().set(&DataKey::CreatorLocks(creator.clone()), &creator_locks);
+
+        // External call last.
+        token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
+
+        env.events().publish(
+            (symbol_short!("lock"), creator),
+            (sender, amount, unlock_time, lock_id),
+        );
+        lock_id
+    }
+
+    /// Withdraws a time-locked tip after its unlock time. Only `creator` may call.
+    ///
+    /// Emits `("unlock", creator)` with data `(amount, lock_id)`.
+    pub fn withdraw_time_locked(env: Env, creator: Address, token: Address, lock_id: u64) {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+
+        let time_lock: TimeLock = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TimeLock(lock_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::LockNotFound));
+
+        if time_lock.creator != creator {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        if time_lock.cancelled {
+            panic_with_error!(&env, TipJarError::LockCancelled);
+        }
+        if env.ledger().timestamp() < time_lock.unlock_time {
+            panic_with_error!(&env, TipJarError::NotUnlocked);
+        }
+
+        // State update before external call (CEI).
+        env.storage().persistent().remove(&DataKey::TimeLock(lock_id));
+
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &creator,
+            &time_lock.amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("unlock"), creator),
+            (time_lock.amount, lock_id),
+        );
+    }
+
+    /// Cancels a time-locked tip and refunds the sender. Only the original sender may call.
+    ///
+    /// Emits `("lk_cncl", sender)` with data `(amount, lock_id)`.
+    pub fn cancel_time_lock(env: Env, sender: Address, token: Address, lock_id: u64) {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+
+        let mut time_lock: TimeLock = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TimeLock(lock_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::LockNotFound));
+
+        if time_lock.sender != sender {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        if time_lock.cancelled {
+            panic_with_error!(&env, TipJarError::LockCancelled);
+        }
+
+        // State update before external call (CEI).
+        time_lock.cancelled = true;
+        env.storage().persistent().set(&DataKey::TimeLock(lock_id), &time_lock);
+
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &sender,
+            &time_lock.amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("lk_cncl"), sender),
+            (time_lock.amount, lock_id),
+        );
+    }
+
+    /// Returns all time-lock records for `creator`.
+    pub fn get_time_locks(env: Env, creator: Address) -> Vec<TimeLock> {
+        let lock_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorLocks(creator))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut locks = Vec::new(&env);
+        for lock_id in lock_ids.iter() {
+            if let Some(lock) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, TimeLock>(&DataKey::TimeLock(lock_id))
+            {
+                locks.push_back(lock);
+            }
+        }
+        locks
+    }
+
+    // ── upgrade / migration ───────────────────────────────────────────────────
+
+    /// Runs any data migration needed after an upgrade. Admin only.
+    ///
+    /// Match on the current version to apply version-specific migrations.
+    pub fn migrate(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        let version = upgrade::get_version(&env);
+        match version {
+            // v1 → v2: no data migration required in this example.
+            _ => {}
         }
     }
 }
