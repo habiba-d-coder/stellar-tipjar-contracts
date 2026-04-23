@@ -5,6 +5,8 @@
 pub mod interfaces;
 pub mod integrations;
 pub mod security;
+pub mod bridge;
+pub mod privacy;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
