@@ -5,6 +5,8 @@
 pub mod interfaces;
 pub mod integrations;
 pub mod security;
+pub mod bridge;
+pub mod privacy;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
@@ -205,6 +207,16 @@ pub enum DataKey {
     CurrentFeeBps,
     /// Monotonically increasing contract version, incremented on each upgrade.
     ContractVersion,
+    /// Authorised bridge relayer address.
+    BridgeRelayer,
+    /// Primary token used for bridged tips.
+    BridgeToken,
+    /// Replay-protection flag for a processed source-chain tx hash.
+    BridgeProcessed(BytesN<32>),
+    /// Spent nullifier for a private tip (prevents double-spend).
+    PrivacyNullifier(BytesN<32>),
+    /// Stored commitment for a private tip, keyed by commitment hash.
+    PrivacyCommitment(BytesN<32>),
 }
 
 #[contracterror]
@@ -442,5 +454,104 @@ impl TipJarContract {
     /// Returns the current contract version (0 before the first upgrade).
     pub fn get_version(env: Env) -> u32 {
         upgrade::get_version(&env)
+    }
+
+    // ── Bridge ────────────────────────────────────────────────────────────────
+
+    /// Sets the authorised bridge relayer and the token used for bridged tips.
+    /// Admin only.
+    pub fn set_bridge_relayer(env: Env, relayer: Address, token: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialised");
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::BridgeRelayer, &relayer);
+        env.storage().instance().set(&DataKey::BridgeToken, &token);
+    }
+
+    /// Processes a cross-chain tip submitted by the authorised relayer.
+    pub fn bridge_tip(env: Env, relayer: Address, tip: bridge::BridgeTip) -> Result<(), TipJarError> {
+        bridge::relayer::process_bridge_tip(&env, &relayer, &tip)
+    }
+
+    // ── Privacy ───────────────────────────────────────────────────────────────
+
+    /// Deposits a private tip commitment into escrow.
+    ///
+    /// The sender transfers `amount` tokens to the contract. The commitment
+    /// `H(creator || amount || blinding_factor)` is stored on-chain. The
+    /// sender's identity is not linked to the creator in any on-chain state.
+    pub fn private_tip(
+        env: Env,
+        sender: Address,
+        token: Address,
+        tip: privacy::PrivateTip,
+        amount: i128,
+    ) -> Result<(), TipJarError> {
+        sender.require_auth();
+        if amount <= 0 {
+            return Err(TipJarError::InvalidAmount);
+        }
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            return Err(TipJarError::TokenNotWhitelisted);
+        }
+        // Commitment must not already exist.
+        if env.storage().persistent().has(&DataKey::PrivacyCommitment(tip.commitment.clone())) {
+            return Err(TipJarError::InvalidAmount);
+        }
+        // Transfer tokens into escrow.
+        token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
+        // Store commitment → (token, amount).
+        env.storage().persistent().set(
+            &DataKey::PrivacyCommitment(tip.commitment.clone()),
+            &(token.clone(), amount),
+        );
+        env.events().publish(
+            (symbol_short!("priv_tip"),),
+            (tip.commitment.clone(), tip.nullifier.clone()),
+        );
+        Ok(())
+    }
+
+    /// Withdraws a private tip by revealing the commitment opening.
+    ///
+    /// The creator proves knowledge of `(creator, amount, blinding_factor)` that
+    /// hashes to the stored commitment. The nullifier prevents double-withdrawal.
+    pub fn private_withdraw(
+        env: Env,
+        tip: privacy::PrivateTip,
+        opening: privacy::CommitmentOpening,
+    ) -> Result<(), TipJarError> {
+        opening.creator.require_auth();
+        // Verify nullifier + commitment opening.
+        privacy::zk_proof::verify_private_tip(&env, &tip, &opening)
+            .map_err(|_| TipJarError::Unauthorized)?;
+        // Load stored (token, amount).
+        let (token, amount): (Address, i128) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PrivacyCommitment(tip.commitment.clone()))
+            .ok_or(TipJarError::NothingToWithdraw)?;
+        // Mark nullifier used and remove commitment.
+        privacy::zk_proof::mark_nullifier_used(&env, &tip.nullifier);
+        env.storage().persistent().remove(&DataKey::PrivacyCommitment(tip.commitment.clone()));
+        // Transfer to creator.
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &opening.creator,
+            &amount,
+        );
+        env.events().publish(
+            (symbol_short!("priv_wdw"), opening.creator.clone()),
+            amount,
+        );
+        Ok(())
     }
 }

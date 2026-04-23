@@ -21,7 +21,13 @@ chrono = { version = "0.4", features = ["serde"] }
 aes-gcm = "0.10"
 rand = "0.8"
 base64 = "0.22"
+quickcheck = "1.0"
+quickcheck_macros = "1.0"
 
 [[test]]
 name = "gas_benchmarks"
 path = "benches/gas_benchmarks.rs"
+
+[[test]]
+name = "quickcheck_properties"
+path = "tests/quickcheck_properties.rs"
