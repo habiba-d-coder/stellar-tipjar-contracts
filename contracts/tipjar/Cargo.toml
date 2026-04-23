@@ -34,5 +34,5 @@ name = "quickcheck_properties"
 path = "tests/quickcheck_properties.rs"
 
 [[test]]
-name = "property_tests"
-path = "tests/property_tests.rs"
+name = "tip_message_tests"
+path = "tests/tip_message_tests.rs"
