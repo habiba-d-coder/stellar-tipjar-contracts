@@ -728,6 +728,9 @@ impl TipJarContract {
 
         Self::update_leaderboard_stats(&env, &sender, &creator, creator_amount);
 
+        // Check and award milestones
+        Self::check_and_award_milestones(&env, &creator, &token, new_tot);
+
         // ── external call last ───────────────────────────────────────────────
         token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
 
@@ -2621,5 +2624,128 @@ impl TipJarContract {
         );
 
         successful_tips
+    }
+
+    // ── milestone rewards ─────────────────────────────────────────────────────
+
+    /// Checks and awards milestones when a creator reaches specific tip thresholds.
+    ///
+    /// Called internally after tips are processed. Emits milestone events.
+    fn check_and_award_milestones(
+        env: &Env,
+        creator: &Address,
+        token: &Address,
+        new_total: i128,
+    ) {
+        let milestones = Self::get_creator_milestones(env, creator);
+
+        for (idx, milestone) in milestones.iter().enumerate() {
+            if !milestone.completed && new_total >= milestone.goal_amount {
+                let reward = (milestone.goal_amount * 5) / 100; // 5% reward
+
+                let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
+                let existing_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+                let new_bal: i128 = existing_bal.checked_add(reward).expect("balance overflow");
+                env.storage().persistent().set(&bal_key, &new_bal);
+
+                let mut updated_milestone = milestone.clone();
+                updated_milestone.completed = true;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Milestone(creator.clone(), idx as u64), &updated_milestone);
+
+                env.events().publish(
+                    (symbol_short!("milestone"),),
+                    (creator.clone(), milestone.goal_amount, reward),
+                );
+            }
+        }
+    }
+
+    /// Creates a milestone for a creator. Admin only.
+    ///
+    /// Emits `("milestone_created",)` with data `(creator, goal_amount)`.
+    pub fn create_milestone(
+        env: Env,
+        admin: Address,
+        creator: Address,
+        goal_amount: i128,
+        description: String,
+    ) -> u64 {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        if goal_amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidGoalAmount);
+        }
+
+        let counter_key = DataKey::MilestoneCounter(creator.clone());
+        let milestone_id: u64 = env.storage().persistent().get(&counter_key).unwrap_or(0);
+
+        let milestone = Milestone {
+            id: milestone_id,
+            creator: creator.clone(),
+            goal_amount,
+            current_amount: 0,
+            description,
+            deadline: None,
+            completed: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Milestone(creator.clone(), milestone_id), &milestone);
+        env.storage()
+            .persistent()
+            .set(&counter_key, &(milestone_id + 1));
+
+        let mut active: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveMilestones(creator.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        active.push_back(milestone_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveMilestones(creator.clone()), &active);
+
+        env.events().publish(
+            (symbol_short!("ms_crt"),),
+            (creator, goal_amount),
+        );
+
+        milestone_id
+    }
+
+    /// Returns all milestones for a creator.
+    pub fn get_creator_milestones(env: &Env, creator: &Address) -> Vec<Milestone> {
+        let milestone_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveMilestones(creator.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        let mut milestones = Vec::new(env);
+        for id in milestone_ids.iter() {
+            if let Some(milestone) = env
+                .storage()
+                .persistent()
+                .get::<_, Milestone>(&DataKey::Milestone(creator.clone(), id))
+            {
+                milestones.push_back(milestone);
+            }
+        }
+        milestones
+    }
+
+    /// Returns a specific milestone for a creator.
+    pub fn get_milestone(env: Env, creator: Address, milestone_id: u64) -> Milestone {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Milestone(creator, milestone_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::MilestoneNotFound))
     }
 }
