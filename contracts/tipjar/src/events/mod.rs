@@ -23,6 +23,17 @@ pub struct TipEvent {
     pub tags: Vec<String>,
 }
 
+/// Withdraw event structure with versioning
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawEvent {
+    pub version: u32,
+    pub creator: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub timestamp: u64,
+}
+
 /// Event types for categorization
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +115,27 @@ pub fn emit_tip_event(
             event.token.clone(),
             event.timestamp,
         ),
+    );
+}
+
+/// Emit a withdraw event with enhanced metadata
+pub fn emit_withdraw_event(
+    env: &Env,
+    creator: &Address,
+    amount: i128,
+    token: &Address,
+) {
+    let event = WithdrawEvent {
+        version: EVENT_VERSION,
+        creator: creator.clone(),
+        amount,
+        token: token.clone(),
+        timestamp: env.ledger().timestamp(),
+    };
+
+    env.events().publish(
+        (symbol_short!("withdraw"), creator.clone()),
+        (event.amount, event.token.clone(), event.timestamp),
     );
 }
 

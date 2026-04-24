@@ -36,3 +36,7 @@ path = "tests/quickcheck_properties.rs"
 [[test]]
 name = "tip_message_tests"
 path = "tests/tip_message_tests.rs"
+
+[[test]]
+name = "events_leaderboard_snapshot_tests"
+path = "tests/events_leaderboard_snapshot_tests.rs"

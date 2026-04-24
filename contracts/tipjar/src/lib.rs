@@ -288,6 +288,20 @@ pub enum DataKey {
     TipHistory(Address, u64),
     /// Total number of tips with metadata stored for a creator.
     TipCount(Address),
+    /// Platform fee in basis points (u32).
+    FeeBasisPoints,
+    /// Accumulated platform fee balance per token.
+    PlatformFeeBalance(Address),
+    /// Refund window in seconds (u64).
+    RefundWindow,
+    /// Leaderboard entries for a given LeaderboardType.
+    Leaderboard(LeaderboardType),
+    /// Tipper total tips sent (i128).
+    TipperTotal(Address),
+    /// State snapshot keyed by snapshot_id.
+    Snapshot(u64),
+    /// Next snapshot ID counter.
+    LatestSnapshot,
 }
 
 #[contracterror]
@@ -561,7 +575,7 @@ impl TipJarContract {
         }
         env.storage().persistent().set(&bal_key, &0i128);
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &creator, &amount);
-        env.events().publish((symbol_short!("withdraw"), creator.clone()), amount);
+        events::emit_withdraw_event(&env, &creator, amount, &token);
     }
 
     /// Returns the current withdrawable balance for `creator` in `token`.
