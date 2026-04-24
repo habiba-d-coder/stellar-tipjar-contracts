@@ -34,3 +34,13 @@ export interface TipEvent {
 export interface WithdrawEvent {
   amount: bigint;
 }
+
+/** Creator profile with optional category and tags. */
+export interface CreatorProfile {
+  address: string;
+  username?: string;
+  categoryId?: string;
+  tags?: string[];
+  totalTips?: bigint;
+  withdrawableBalance?: bigint;
+}
