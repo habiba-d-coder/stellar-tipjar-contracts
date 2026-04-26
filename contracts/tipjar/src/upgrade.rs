@@ -1,6 +1,6 @@
 use soroban_sdk::{symbol_short, BytesN, Env};
 
-use crate::{DataKey, TipJarError};
+use crate::{storage, TipJarError};
 
 /// Performs an admin-authorized WASM upgrade and bumps the on-chain version.
 ///
@@ -40,19 +40,17 @@ pub fn upgrade(env: &Env, new_wasm_hash: BytesN<32>) {
     let admin: soroban_sdk::Address = env
         .storage()
         .instance()
-        .get(&DataKey::Admin)
-        .unwrap_or_else(|| soroban_sdk::panic_with_error!(env, TipJarError::Unauthorized));
+        .get(&crate::DataKey::Admin)
+        .unwrap_or_else(|| soroban_sdk::panic_with_error!(env, TipJarError::UpgradeUnauthorized));
     admin.require_auth();
 
-    let new_version = get_version(env) + 1;
+    let new_version = storage::get_contract_version(env).saturating_add(1);
 
-    // Atomically swap the executing WASM.  Storage is preserved by the host.
+    // Atomically swap the executing WASM. Storage is preserved by the host.
     env.deployer().update_current_contract_wasm(new_wasm_hash);
 
     // Persist the new version *after* the WASM swap so the new code sees it.
-    env.storage()
-        .instance()
-        .set(&DataKey::ContractVersion, &new_version);
+    storage::set_contract_version(env, new_version);
 
     env.events()
         .publish((symbol_short!("upgraded"),), (new_version,));
@@ -60,8 +58,5 @@ pub fn upgrade(env: &Env, new_wasm_hash: BytesN<32>) {
 
 /// Returns the current contract version (0 before the first upgrade).
 pub fn get_version(env: &Env) -> u32 {
-    env.storage()
-        .instance()
-        .get(&DataKey::ContractVersion)
-        .unwrap_or(0)
+    storage::get_contract_version(env)
 }

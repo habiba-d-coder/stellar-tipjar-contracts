@@ -18,6 +18,7 @@ mod failure_scenarios;
 mod gas_analysis;
 mod property_tests;
 mod cross_contract;
+mod upgrade_tests;
 
 #[cfg(test)]
 mod integration_tests {
@@ -46,6 +47,10 @@ mod integration_tests {
         failure_scenarios::test_unauthorized_access();
         failure_scenarios::test_invalid_token_operations();
         failure_scenarios::test_time_based_failures();
+
+        upgrade_tests::test_upgrade_versioning_and_state_preservation();
+        upgrade_tests::test_upgrade_authorization();
+        upgrade_tests::test_upgrade_rollback();
 
         gas_analysis::test_basic_operation_costs();
         gas_analysis::test_batch_operation_efficiency();

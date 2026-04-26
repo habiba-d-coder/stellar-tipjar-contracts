@@ -14,6 +14,7 @@ use soroban_sdk::{
 };
 
 pub mod upgrade;
+pub mod storage;
 
 #[cfg(test)]
 extern crate std;
@@ -1697,6 +1698,22 @@ impl TipJarContract {
     /// Returns the current contract version (0 before the first upgrade).
     pub fn get_version(env: Env) -> u32 {
         upgrade::get_version(&env)
+    }
+
+    /// Applies any required state migrations after a WASM upgrade.
+    ///
+    /// This is a safe, idempotent entrypoint for release-specific storage
+    /// updates that must run after the host preserves storage during upgrade.
+    pub fn migrate_state(env: Env) {
+        let version = upgrade::get_version(&env);
+        match version {
+            1 => {
+                // No migration is required for the current v1 release.
+                // Future upgrades can add version-specific migration paths
+                // here, e.g. `migrate_v1_to_v2` or `migrate_v2_to_v3`.
+            }
+            _ => {}
+        }
     }
 
     /// Sets the configuration for a subscription tier. Admin only.
